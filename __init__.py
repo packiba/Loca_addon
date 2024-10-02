@@ -4,7 +4,6 @@ from bpy.props import IntProperty, EnumProperty, BoolProperty, PointerProperty
 from bpy.utils import register_class, unregister_class, previews
 import os
 import json
-import numpy
 from mathutils import Matrix
 
 
@@ -12,7 +11,7 @@ from mathutils import Matrix
 bl_info = {
     "name": "loca",
     "author": "Pavel Kiba",
-    "version": (1, 3, 0),
+    "version": (1, 5, 0),
     "blender": (4, 1, 0),
     "location": "View3D > N-Panel > Animation",
     "description": "Create bone locators for animation",
@@ -29,26 +28,6 @@ axes = [
     ('TRACK_NEGATIVE_Y', '-Y', 'Select  -Y', 3),
     ('TRACK_NEGATIVE_Z', '-Z', 'Select  -Z', 5),
 ]
-
-# Создание глобальной переменной для хранения иконок
-custom_icons = None
-
-def load_custom_icons():
-    global custom_icons
-    custom_icons = previews.new()
-
-    # Путь к папке с иконками
-    icons_dir = os.path.join(os.path.dirname(__file__), "icons")
-
-    # Загрузка иконки:
-    custom_icons.load("TL_icon", os.path.join(icons_dir, "TL_icon.png"), 'IMAGE')
-    custom_icons.load("RL_icon", os.path.join(icons_dir, "RL_icon.png"), 'IMAGE')
-    custom_icons.load("AL_icon", os.path.join(icons_dir, "AL_icon.png"), 'IMAGE')
-    custom_icons.load("confirm_icon", os.path.join(icons_dir, "confirm_icon.png"), 'IMAGE')
-
-def unload_custom_icons():
-    global custom_icons
-    previews.remove(custom_icons)
 
 # Global list to store locator names for rotation target
 global locators_RT_name_list
@@ -81,11 +60,18 @@ def set_keys_on_constraint_influence(constraint, st_frame, end_frame):
     constraint.keyframe_insert(data_path="influence", frame=st_frame)
     constraint.keyframe_insert(data_path="influence", frame=end_frame)
 
-# Function to show a message box
+def apply_constraint(pose_bone, constraint_type, target, subtarget, track_axis=None):
+    constraint = pose_bone.constraints.new(constraint_type)
+    constraint.target = target
+    constraint.subtarget = subtarget
+    if constraint_type == 'DAMPED_TRACK' and track_axis:
+        constraint.track_axis = track_axis
+    constraint.name += "_LOCA"
+    return constraint
+
 def show_message_box(message="", ttl="Message Box", ic='INFO'):
     def draw(self, context):
         self.layout.label(text=message)
-
     bpy.context.window_manager.popup_menu(draw, title=ttl, icon=ic)
 
 # Remove all F-Curves from all actions that contain the target_string in their data_path
@@ -110,6 +96,7 @@ def find_and_remove_broken_fcurves(context, constraint_name_part="__Loca"):
                 continue                
             try:
                 eval('obj.' + data_path)
+                obj.path_resolve(data_path)
             except:
                 fcurves_to_remove.append(fcurve)
         for fcurve in fcurves_to_remove:
@@ -124,35 +111,35 @@ def hide_scale_fcurves(armature_name, bone_name='_LOCA'):
                 if 'scale' in fcurve.data_path:
                     fcurve.hide = True
 
-# Function to read json file with widgets
-widgets_cache = None
 
-def load_widgets():
-    global widgets_cache
-    if widgets_cache is not None:
-        return widgets_cache
+class WidgetCache:
+    cache = None
 
-    jsonFile = os.path.join(os.path.dirname(__file__), 'widgets.json')
-    if os.path.exists(jsonFile):
-        try:
-            with open(jsonFile, 'r') as f:
-                widgets_cache = json.load(f)
-        except (IOError, json.JSONDecodeError) as e:
-            show_message_box(f"File reading error: {e}", "Error", 'ERROR')
-    return widgets_cache if widgets_cache else {}
+    @classmethod
+    def load_widgets(cls):
+        if cls.cache is not None:
+            return cls.cache
+        json_file = os.path.join(os.path.dirname(__file__), 'widgets.json')
+        if os.path.exists(json_file):
+            try:
+                with open(json_file, 'r') as f:
+                    cls.cache = json.load(f)
+            except (IOError, json.JSONDecodeError) as e:
+                show_message_box(f"File reading error: {e}", "Error", 'ERROR')
+                cls.cache = {}
+        else:
+            cls.cache = {}
+        return cls.cache
 
 # Function to reate widget for bone
 def create_widget(bone, widget_name, widget_scale=[1, 1, 1], relative_size=True):
     context = bpy.context
     data = bpy.data
-    widgets = load_widgets()
-    
+    widgets = WidgetCache.load_widgets()    
     if widget_name not in widgets:
         show_message_box(f"Widget '{widget_name}' not found in widgets.json.", "Error", 'ERROR')
         return
-
     widget_data = widgets[widget_name]
-
     matrixBone = bone
 
     # Create a new mesh for the widget
@@ -162,8 +149,11 @@ def create_widget(bone, widget_name, widget_scale=[1, 1, 1], relative_size=True)
     bone_length = 1 if relative_size else (1 / bone.bone.length)
 
     # Preliminary calculation of scaling
-    scale_factors = numpy.array([widget_scale[0] * bone_length, widget_scale[2] * bone_length, widget_scale[1] * bone_length])
-    widget_vertices = numpy.array(widget_data['vertices']) * scale_factors
+    scale_factors = [widget_scale[0] * bone_length, widget_scale[2] * bone_length, widget_scale[1] * bone_length]
+    widget_vertices = [
+        (v[0] * scale_factors[0], v[1] * scale_factors[1], v[2] * scale_factors[2])
+        for v in widget_data['vertices']
+    ]
 
     # Create and apply transformation matrix
     widget_transform_matrix = Matrix.Diagonal([bone_length, bone_length, bone_length, 1.0])
@@ -188,26 +178,38 @@ def create_widget(bone, widget_name, widget_scale=[1, 1, 1], relative_size=True)
     bone.bone.show_wire = True
 
 def get_final_frame_from_locator(context, loc_name):
-        armature = context.active_object
-        end_frame = context.scene.frame_end
-        if armature.animation_data and armature.animation_data.action:
-            for fcurve in armature.animation_data.action.fcurves:
-                if f'{loc_name}_LOCA' in fcurve.data_path.split('"')[1]:
-                    end_frame = int(fcurve.keyframe_points[-1].co[0])
-        return end_frame
+    armature = context.active_object
+    end_frame = context.scene.frame_end
+    if armature.animation_data and armature.animation_data.action:
+        for fcurve in armature.animation_data.action.fcurves:
+            if f'{loc_name}_LOCA' in fcurve.data_path.split('"')[1]:
+                end_frame = int(fcurve.keyframe_points[-1].co[0])
+    return end_frame
 
 def delete_locators(context, locators):
-        armature = context.active_object
-        for loc_name in locators:
-            if loc_name in armature.data.edit_bones:
-                armature.data.edit_bones.remove(armature.data.edit_bones[loc_name])
+    armature = context.active_object
+    for loc_name in locators:
+        if loc_name in armature.data.edit_bones:
+            armature.data.edit_bones.remove(armature.data.edit_bones[loc_name])
 
-# Operator to get the preview range
 def get_preview_range(context):
     scene = context.scene
     props = scene.loca
     props.bake_start_fr = scene.frame_preview_start
     props.bake_end_fr = scene.frame_preview_end
+
+def update_locator_size(self, context):
+    size = self.locator_size
+    selected_bones = context.selected_pose_bones
+    for bone_P in selected_bones:
+        if '_LOCA' in bone_P.name:
+            current_scale = bone_P.custom_shape_scale_xyz
+            bone_P.custom_shape_scale_xyz = (
+                current_scale[0] * size,
+                current_scale[1] * size,
+                current_scale[2] * size
+            )
+    self.locator_size = 1.0
     
 # Property group to store addon properties
 class locaProps(PropertyGroup):
@@ -244,6 +246,16 @@ class locaProps(PropertyGroup):
     add_attached_locator: BoolProperty(
     description="Create Attached Locator",
     default=False,
+    )
+    locator_size: bpy.props.FloatProperty(
+        name="Locator Size",
+        description="Size of the selected locator",
+        default=1.0,
+        min=0.8,
+        max=1.2,
+        step=0.05,
+        precision=2,
+        update=update_locator_size
     )
 
 
@@ -313,10 +325,7 @@ class ARMATURE_OT_loca_create_locator(Operator):
                 bpy.ops.pose.visual_transform_apply()
                 if locator_P.constraints:
                     locator_P.constraints.remove(locator_P.constraints[0])
-                copy_transforms = bone_P.constraints.new('COPY_TRANSFORMS')
-                copy_transforms.name = 'Copy locator transforms__Loca'
-                copy_transforms.target = armature
-                copy_transforms.subtarget = locator_P.name
+                apply_constraint(bone_P, 'COPY_TRANSFORMS', armature, locator_P.name)
         else:
             select_bones(context, locator_P.name)
             if not has_armature_constraint:
@@ -325,11 +334,7 @@ class ARMATURE_OT_loca_create_locator(Operator):
                 remove_fcurves_by_data_path(context, 'active_selection_set')
 
                 hide_scale_fcurves(armature.name)
-            copy_transforms = bone_P.constraints.new('COPY_TRANSFORMS')
-            copy_transforms.name = 'Copy locator transforms__Loca'
-            copy_transforms.target = armature
-            copy_transforms.subtarget = locator_P.name
-
+            copy_transforms = apply_constraint(bone_P, 'COPY_TRANSFORMS', armature, locator_P.name)
             set_keys_on_constraint_influence(copy_transforms, st_frame, end_frame)
 
         set_armature_mode(context, "POSE")
@@ -363,10 +368,7 @@ class ARMATURE_OT_loca_create_locator(Operator):
             show_message_box(
                 f"Selected bone {bone_P.name} has an ARMATURE constraint. You will not be able to bake animation on it further" , 'THE BONE HAS AN ARMATURE CONSTRAINT')
         else:
-            copy_transforms = locator_P.constraints.new('COPY_TRANSFORMS')
-            copy_transforms.target = armature
-            copy_transforms.subtarget = bone_P.name
-            copy_transforms.name += "_LOCA"
+            apply_constraint(locator_P, 'COPY_TRANSFORMS', armature, bone_P.name)
 
         # make locator active in POSEMODE
         context.object.data.bones.active = locator_P.bone
@@ -421,17 +423,15 @@ class ARMATURE_OT_loca_create_locator_RL_AL(Operator):
         end_frame = props.bake_end_fr
 
         set_armature_mode(context, "POSE")
-        bone_name = loc_name.split('_LOCA')[0]
-
+        bone_name = loc_name.rsplit('_LOCA', 1)[0]
+        print('loc_name', loc_name)
+        print('bone_name', bone_name)
         locator = context.object.data.bones[loc_name]
         locator_P = context.object.pose.bones[loc_name]
         context.object.data.bones.active = locator
         pose_bone = context.object.pose.bones[bone_name]
 
-        child_of = locator_P.constraints.new('CHILD_OF')
-        child_of.target = armature
-        child_of.subtarget = bone_name
-        child_of.name += "_LOCA"
+        apply_constraint(locator_P, 'CHILD_OF', armature, bone_name)
 
         if props.without_baking:
             bpy.ops.pose.visual_transform_apply()
@@ -439,18 +439,11 @@ class ARMATURE_OT_loca_create_locator_RL_AL(Operator):
                     locator_P.constraints.remove(locator_P.constraints[0])
 
             if props.add_attached_locator:
-                child_of = locator_P.constraints.new('CHILD_OF')
-                child_of.target = armature
-                child_of.subtarget = bone_name
-                child_of.name += "_LOCA"
+                child_of = apply_constraint(locator_P, 'CHILD_OF', armature, bone_name)
                 set_keys_on_constraint_influence(child_of, st_frame, end_frame)
                 create_widget(locator_P, "locator_al")
             else:
-                damped_track = pose_bone.constraints.new('DAMPED_TRACK')
-                damped_track.name = 'Damped Track to locator__Loca'
-                damped_track.target = armature
-                damped_track.subtarget = loc_name
-                damped_track.track_axis = props.axis
+                damped_track = apply_constraint(pose_bone, 'DAMPED_TRACK', armature, loc_name, props.axis)
                 set_keys_on_constraint_influence(damped_track, st_frame, end_frame)
                 create_widget(locator_P, "locator_rl")
             if armature.animation_data and armature.animation_data.action:
@@ -458,7 +451,14 @@ class ARMATURE_OT_loca_create_locator_RL_AL(Operator):
                     if loc_name in fcurve.data_path:
                         armature.animation_data_clear()
         else:
-            if not props.add_attached_locator:
+            if props.add_attached_locator:
+                create_widget(locator_P, "locator_al")
+                if armature.animation_data and armature.animation_data.action:
+                    action = armature.animation_data.action
+                    curves_to_remove = [fcurve for fcurve in action.fcurves if loc_name in fcurve.data_path]                    
+                    for fcurve in curves_to_remove:
+                        action.fcurves.remove(fcurve)                
+            else:
                 select_bones(context, loc_name)
                 bpy.ops.anim.keyframe_insert_menu(type='Location')
                 bpy.ops.nla.bake(frame_start=st_frame, frame_end=end_frame, only_selected=True,
@@ -468,21 +468,9 @@ class ARMATURE_OT_loca_create_locator_RL_AL(Operator):
                 if locator_P.constraints:
                     locator_P.constraints.remove(locator_P.constraints[0])
                 hide_scale_fcurves(armature.name)
-            
-                damped_track = pose_bone.constraints.new('DAMPED_TRACK')
-                damped_track.name = 'Damped Track to locator__Loca'
-                damped_track.target = armature
-                damped_track.subtarget = loc_name
-                damped_track.track_axis = props.axis
+                damped_track = apply_constraint(pose_bone, 'DAMPED_TRACK', armature, loc_name, props.axis)
                 set_keys_on_constraint_influence(damped_track, st_frame, end_frame)
                 create_widget(locator_P, "locator_rl")
-            else:
-                create_widget(locator_P, "locator_al")
-                if armature.animation_data and armature.animation_data.action:
-                    action = armature.animation_data.action
-                    curves_to_remove = [fcurve for fcurve in action.fcurves if loc_name in fcurve.data_path]                    
-                    for fcurve in curves_to_remove:
-                        action.fcurves.remove(fcurve)
 
             select_bones(context, loc_name)
 
@@ -566,7 +554,7 @@ class ARMATURE_OT_loca_bake_and_delete(Operator):
             )
 
         remove_fcurves_by_data_path(context, 'active_selection_set')        
-        remove_constraints_by_name_part(bone_P, '__Loca')
+        remove_constraints_by_name_part(bone_P, '_LOCA')
         find_and_remove_broken_fcurves(context)      
         hide_scale_fcurves(armature.name, bone_name)
 
@@ -578,10 +566,10 @@ class ARMATURE_OT_loca_bake_and_delete(Operator):
         for bone in bones_name_list:
             self.bake(context, bone)
 
-        locators_name_list = [bone.name for bone in armature.pose.bones if '_LOCA' in bone.name]
+        locators_to_remove  = [bone.name for bone in armature.pose.bones if '_LOCA' in bone.name]
 
         set_armature_mode(context, "EDIT")
-        delete_locators(context, locators_name_list)
+        delete_locators(context, locators_to_remove )
         set_armature_mode(context, "POSE")
         remove_fcurves_by_data_path(context, '_LOCA')
 
@@ -633,7 +621,7 @@ class ARMATURE_OT_loca_bake_and_delete_selected(Operator):
             bake_types={'POSE'}
         )
         remove_fcurves_by_data_path(context, 'active_selection_set')
-        remove_constraints_by_name_part(bone_P, '__Loca')
+        remove_constraints_by_name_part(bone_P, '_LOCA')
         remove_fcurves_by_data_path(context, f'{bone_name}_LOCA')
         find_and_remove_broken_fcurves(context)
 
@@ -641,24 +629,22 @@ class ARMATURE_OT_loca_bake_and_delete_selected(Operator):
         armature = context.active_object
         selected_bones = [bone for bone in armature.pose.bones if bone.bone.select]
         original_bone_list = set()
-        locators_name_list = set()
+        locators_to_remove  = set()
 
         for bone in selected_bones:
-            if '_LOCA' in bone.name:
-                original_bone_name = bone.name.split('_LOCA')[0]
-                original_bone = armature.pose.bones.get(original_bone_name)
-                original_bone_list.add(original_bone)
-            else:
-                original_bone_list.add(bone)
+            if any("_LOCA_" in constraint.subtarget for constraint in bone.constraints):
+                    original_bone_list.add(bone)
+                    print(bone.name)
 
         for bone in original_bone_list:
             if not any(constraint.type == 'ARMATURE' for constraint in bone.constraints):
-                locators_name_list.update(constraint.subtarget for constraint in bone.constraints 
-                if '__Loca' in constraint.name and constraint.target)
+                locators_to_remove .update(constraint.subtarget for constraint in bone.constraints 
+                if '_LOCA' in constraint.name and constraint.target)
                 self.bake(context, bone.name)
+        print('locators_to_remove', locators_to_remove)
 
         set_armature_mode(context, "EDIT")
-        delete_locators(context, locators_name_list)
+        # delete_locators(context, locators_to_remove )
         set_armature_mode(context, "POSE")
 
         self.report({'INFO'}, 'Relevant Bones Baked & Selected Locators Removed')
@@ -679,10 +665,11 @@ class ARMATURE_OT_loca_delete_selected_locators(Operator):
 
         for bone in selected_bones:
             if '_LOCA' in bone.name:
+                base_bone_name = bone.name.rsplit('_LOCA_', 1)[0]
                 # Bone associated with the locator
-                base_bone_name = bone.name.split('_LOCA')[0]
-                base_bone_P = context.object.pose.bones[base_bone_name]
-                remove_constraints_by_name_part(base_bone_P, '__Loca')
+                if base_bone_name in context.object.pose.bones:
+                    base_bone_P = context.object.pose.bones[base_bone_name]
+                    remove_constraints_by_name_part(base_bone_P, '_LOCA')
                 locators_to_delete.append(bone.name)
 
         set_armature_mode(context, "EDIT")
@@ -711,7 +698,60 @@ class ARMATURE_OT_loca_select_all_locators(Operator):
 
         self.report({'INFO'}, 'All locators selected')
         return {'FINISHED'}
+    
+# Operator to cycle through widgets
+class ARMATURE_OT_loca_cycle_widget(Operator):
+    """Cycle through widgets for selected locators"""
+    bl_label = "Cycle Locator Widget"
+    bl_idname = "loca.cycle_widget"
+    bl_options = {'REGISTER', 'UNDO'}
 
+    def execute(self, context):
+        widgets = WidgetCache.load_widgets()
+        widget_names = list(widgets.keys())
+        if not widget_names:
+            self.report({'WARNING'}, "No widgets found in widgets.json")
+            return {'CANCELLED'}
+
+        selected_bones = context.selected_pose_bones
+        for bone_P in selected_bones:
+            if '_LOCA' in bone_P.name:
+                # Get current widget index
+                bone = bone_P.bone
+                widget_index = bone.get("widget_index", -1)
+                # Increment index
+                widget_index = (widget_index + 1) % len(widget_names)
+                widget_name = widget_names[widget_index]
+                # Assign widget
+                create_widget(bone_P, widget_name)
+                # Store widget index
+                bone["widget_index"] = widget_index
+                # Optionally, report which widget was assigned
+                self.report({'INFO'}, f"Assigned widget '{widget_name}' to locator '{bone_P.name}'")
+        return {'FINISHED'}
+    
+class ARMATURE_OT_loca_cycle_color(Operator):
+    """Cycle through colors for selected locators"""
+    bl_label = "Cycle Locator Color"
+    bl_idname = "loca.cycle_color"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        selected_bones = context.selected_pose_bones
+
+        current_palette_str = selected_bones[0].color.palette if hasattr(selected_bones[0].color, 'palette') else "THEME13"
+        print('current_palette_str', current_palette_str)
+        try:
+            current_palette_index = int(current_palette_str[-2:])
+        except ValueError:
+            current_palette_index = 13
+        for bone_P in selected_bones:
+            if '_LOCA' in bone_P.name:
+                new_palette_index = (current_palette_index % 15) + 1
+                bone_P.color.palette = f"THEME{new_palette_index:02d}"
+                self.report({'INFO'}, f"Changed color to {bone_P.color.palette} for locator '{bone_P.name}'")
+        return {'FINISHED'}
+    
     
 
 class VIEW3D_PT_loca_locators_panel(Panel):
@@ -739,34 +779,59 @@ class VIEW3D_PT_loca_locators_panel(Panel):
                 col.prop(props, "without_baking", text='Skip Locator Bake')
                 col1 = col.column(align=True)
                 col1.operator(ARMATURE_OT_loca_create_locator.bl_idname,
-                              text=" Add Transform Locator", icon_value=custom_icons["TL_icon"].icon_id).add_rl_or_al = False
+                              text=" Add Transform Locator", icon='EVENT_T').add_rl_or_al = False
                 col1.operator(ARMATURE_OT_loca_create_locator.bl_idname,
-                              text=" Add Rotation Locator", icon_value=custom_icons["RL_icon"].icon_id).add_rl_or_al = True
+                              text=" Add Rotation Locator", icon='EVENT_R').add_rl_or_al = True
                 col1.operator(ARMATURE_OT_loca_create_locator_AL.bl_idname,
-                              text=" Add Attached Locator", icon_value=custom_icons["AL_icon"].icon_id)
+                              text=" Add Attached Locator", icon='EVENT_A')
                 col1.scale_y = 1.3
                 if is_any_locator:
+                    selected_pose_bones = context.selected_pose_bones
+                    show_bake_selected = False
+                    locator_selected = False
+                    for bone in selected_pose_bones:
+                        for constraint in bone.constraints:
+                            if constraint.subtarget and "_LOCA_" in constraint.subtarget:
+                                show_bake_selected = True
+                                break
+                        if "_LOCA_" in bone.name:
+                            locator_selected = True
+
                     col.separator()
                     box = col.box()
-                    col1 = box.column(align=True)
-                    col1.operator(ARMATURE_OT_loca_bake_and_delete.bl_idname,
-                                  text="Bake & Remove Locators").bake_on_delete = True
-                    col1.operator(ARMATURE_OT_loca_bake_and_delete_selected.bl_idname, text="Bake Selected Bone")
-                    
-                    col2 = box.column(align=True)
-                    col2.operator(ARMATURE_OT_loca_bake_and_delete.bl_idname,
-                                  text="Remove All Locators").bake_on_delete = False
-                    col2.operator(ARMATURE_OT_loca_delete_selected_locators.bl_idname, text="Remove Selected Locator")
                     col3 = box.column(align=True)
                     col3.operator(ARMATURE_OT_loca_select_all_locators.bl_idname,
                               text="Select All Locators")
+                    col1 = box.column(align=True)
+                    col1.operator(ARMATURE_OT_loca_bake_and_delete.bl_idname,
+                                  text="Bake & Remove Locators").bake_on_delete = True
+
+                    # Отобразить оператор только если найдено соответствие
+                    row =col1.row()
+                    row.enabled = show_bake_selected
+                    row.operator(ARMATURE_OT_loca_bake_and_delete_selected.bl_idname, text="Bake Selected Bone")
+                    
+                    col2 = box.column(align=True)
+                    row =col2.row()
+                    row.enabled = locator_selected
+                    row.operator(ARMATURE_OT_loca_delete_selected_locators.bl_idname, text="Remove Selected Locator")
+                    col2.operator(ARMATURE_OT_loca_bake_and_delete.bl_idname,
+                                  text="Remove All Locators").bake_on_delete = False
+
+                    
+                    col4 = box.column(align=True)
+                    col4.enabled = locator_selected
+                    row2 = col4.row(align=True)
+                    row2.operator(ARMATURE_OT_loca_cycle_widget.bl_idname, text="Widget")
+                    row2.operator(ARMATURE_OT_loca_cycle_color.bl_idname, text="Color")
+                    col4.prop(props, "locator_size", text="Size", slider=True)
             else:
                 col.prop(props, "select_axis", text='Select Local Axis')
                 if props.select_axis:
                     row = col.row(align=True)
                     row.prop(props, "axis", expand=True)
                 col.operator(ARMATURE_OT_loca_create_locator_RL_AL.bl_idname,
-                             text=" Confirm Locator Position", icon_value=custom_icons["confirm_icon"].icon_id, depress=True)
+                             text=" Confirm Locator Position", icon='PLAY', depress=True)
                 
             col1 = col.column(align=True)
 
@@ -788,6 +853,8 @@ classes = [
     ARMATURE_OT_loca_bake_and_delete_selected,
     ARMATURE_OT_loca_delete_selected_locators,
     ARMATURE_OT_loca_select_all_locators,
+    ARMATURE_OT_loca_cycle_widget,
+    ARMATURE_OT_loca_cycle_color,
     VIEW3D_PT_loca_locators_panel,
 ]
 
@@ -796,13 +863,11 @@ def register():
         register_class(cl)
 
     bpy.types.Scene.loca = PointerProperty(type=locaProps)
-    load_custom_icons()
 
 def unregister():
     for cl in reversed(classes):
         unregister_class(cl)
     del bpy.types.Scene.loca
-    unload_custom_icons()
 
 if __name__ == "__main__":
     register()
